@@ -53,13 +53,17 @@ func main() {
 	limiter := NewLimiter(rdb, clock)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/ping", handlePing(nodeID, rdb))
 
-	// Chain middlewares: validateCustomerHeader -> LimitMiddleware -> mux handler
-	handler := validateCustomerHeader(limiter.LimitMiddleware(mux))
+	// Sliding Window endpoint
+	slidingHandler := nodeHeaderMiddleware(nodeID, validateCustomerHeader(limiter.LimitMiddleware(handlePing(nodeID, rdb))))
+	mux.Handle("/api/v1/ping", slidingHandler)
+
+	// Naive Fixed Window endpoint
+	fixedHandler := nodeHeaderMiddleware(nodeID, validateCustomerHeader(limiter.FixedLimitMiddleware(handlePing(nodeID, rdb))))
+	mux.Handle("/api/v1/ping-fixed", fixedHandler)
 
 	log.Printf("Starting server on port %s (Node: %s)...", port, nodeID)
-	if err := http.ListenAndServe(":"+port, handler); err != nil {
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
 }
@@ -81,6 +85,14 @@ func initRedis(addr string) (*redis.Client, error) {
 		return nil, err
 	}
 	return rdb, nil
+}
+
+// nodeHeaderMiddleware injects the X-Node-Id header into all HTTP responses.
+func nodeHeaderMiddleware(nodeID string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Node-Id", nodeID)
+		next.ServeHTTP(w, r)
+	})
 }
 
 // validateCustomerHeader is a middleware verifying the X-Customer-Id header is present.

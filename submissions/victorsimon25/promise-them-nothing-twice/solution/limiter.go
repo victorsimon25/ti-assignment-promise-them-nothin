@@ -49,6 +49,24 @@ else
 end
 `
 
+// Lua script for Naive Fixed Window Rate Limiter
+const fixedLimitLua = `
+local key = KEYS[1]
+local limit = tonumber(ARGV[1])
+
+local current_count = tonumber(redis.call('GET', key) or "0")
+
+if current_count < limit then
+    redis.call('INCR', key)
+    if current_count == 0 then
+        redis.call('EXPIRE', key, 60)
+    end
+    return {1, 0}
+else
+    return {0, 60}
+end
+`
+
 // Limiter coordinates Redis and customer configs to apply rate limits.
 type Limiter struct {
 	rdb        *redis.Client
@@ -65,6 +83,9 @@ func NewLimiter(rdb *redis.Client, clock Clock) *Limiter {
 			"customer-starter":    60,
 			"customer-growth":     300,
 			"customer-enterprise": 300, // Northwind Enterprise default
+			"customer-priya-1":    100,
+			"customer-priya-2":    100,
+			"customer-priya-3":    100,
 		},
 	}
 }
@@ -88,7 +109,7 @@ func (l *Limiter) getLimitForCustomer(customerID string, now time.Time) int {
 	return limit
 }
 
-// LimitMiddleware returns a middleware that rate-limits incoming HTTP requests.
+// LimitMiddleware returns a middleware that rate-limits incoming HTTP requests using Sliding Window Log.
 func (l *Limiter) LimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		customerID := r.Header.Get("X-Customer-Id")
@@ -146,6 +167,65 @@ func (l *Limiter) LimitMiddleware(next http.Handler) http.Handler {
 			w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
 			w.WriteHeader(http.StatusTooManyRequests)
 			_ = json.NewEncoder(w).Encode(ErrorResponse{Error: fmt.Sprintf("rate limit exceeded. Try again in %d seconds", retryAfter)})
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// FixedLimitMiddleware returns a middleware that rate-limits incoming HTTP requests using Fixed Window.
+func (l *Limiter) FixedLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		customerID := r.Header.Get("X-Customer-Id")
+		if customerID == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if l.rdb == nil {
+			// Fail-closed
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(ErrorResponse{Error: "Rate limiter state unavailable (Redis down)"})
+			return
+		}
+
+		now := l.clock.Now(r)
+		limit := l.getLimitForCustomer(customerID, now)
+
+		// Fixed window key aligned to minute boundary (e.g. 10:00:00 to 10:00:59)
+		windowStart := now.Unix() / 60 * 60
+		key := fmt.Sprintf("fixed_limit:%s:%d", customerID, windowStart)
+
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		res, err := l.rdb.Eval(ctx, fixedLimitLua, []string{key}, limit).Result()
+		if err != nil {
+			log.Printf("Redis error during fixed rate limiting: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(ErrorResponse{Error: "Rate limiter state unavailable (Redis error)"})
+			return
+		}
+
+		resSlice, ok := res.([]interface{})
+		if !ok || len(resSlice) < 2 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(ErrorResponse{Error: "Rate limiter internal error"})
+			return
+		}
+
+		allowed := resSlice[0].(int64) == 1
+		retryAfter := resSlice[1].(int64)
+
+		if !allowed {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(ErrorResponse{Error: fmt.Sprintf("fixed rate limit exceeded. Try again in %d seconds", retryAfter)})
 			return
 		}
 

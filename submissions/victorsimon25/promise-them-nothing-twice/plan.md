@@ -73,11 +73,18 @@ At each level, specific verification checks are provided to confirm correctness 
 * **Verification**:
   - [x] Verify fail-closed behavior returns `503 Service Unavailable` on Redis failure.
 
-### Level 7: Verification Harness Implementation
+### Level 7: Verification Harness Implementation [COMPLETED]
 * **Goal**: Build a CLI harness that drives load, validates correctness, and prints clear compliance results.
 * **Steps**:
-  1. Create a Go command line harness.
-  2. Implement simulated traffic loads for different customer classes, including time-based shifts.
-  3. Validate responses (200, 429, 503) and log stats.
+  - [x] Create a Go command line harness.
+  - [x] Implement simulated traffic loads for different customer classes:
+    - [x] Bursts at boundary: Starter (60 Reqs Burst)
+    - [x] Burst outside window: Enterprise (320 Reqs Burst -> 300 OK / 20 blocked)
+    - [x] Capacity limit proof inside window: Enterprise (1700 Reqs Burst -> 1500 OK / 200 blocked)
+    - [x] Priya's demo: isolation testing (three concurrent customer runs)
+    - [x] Sliding window log boundary test: double consecutive bursts (300 + 300)
+  - [x] Implement node distribution reporting in table output.
+  - [x] Implement robust client timeouts and fail-closed assertion.
 * **Verification**:
-  - Run harness and verify it prints a clean test summary proving the core requirements.
+  - [x] Run harness with Redis online and verify all scenarios PASS and show load balanced node distributions.
+  - [x] Run harness with Redis offline and verify Scenario 6 PASSes (503s).
