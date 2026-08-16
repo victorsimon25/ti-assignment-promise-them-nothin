@@ -1,17 +1,30 @@
 package main
 
-import "time"
+import (
+	"net/http"
+	"os"
+	"time"
+)
 
 // Clock provides an interface to resolve the current time.
-// This allows us to mock the clock in tests and for time-window switching.
+// It accepts an optional HTTP request to extract mock times for testing.
 type Clock interface {
-	Now() time.Time
+	Now(r *http.Request) time.Time
 }
 
-// RealClock uses the standard system time.
+// RealClock resolves either the system time or the request-scoped X-Fake-Time
+// header if ALLOW_MOCK_TIME=true is configured in the environment.
 type RealClock struct{}
 
-// Now returns the current system time.
-func (RealClock) Now() time.Time {
-	return time.Now()
+// Now returns the resolved time.
+func (RealClock) Now(r *http.Request) time.Time {
+	if os.Getenv("ALLOW_MOCK_TIME") == "true" && r != nil {
+		fakeTimeStr := r.Header.Get("X-Fake-Time")
+		if fakeTimeStr != "" {
+			if t, err := time.Parse(time.RFC3339, fakeTimeStr); err == nil {
+				return t.UTC()
+			}
+		}
+	}
+	return time.Now().UTC()
 }
