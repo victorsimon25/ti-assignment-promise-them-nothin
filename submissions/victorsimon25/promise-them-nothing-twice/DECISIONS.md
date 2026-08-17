@@ -1,34 +1,19 @@
 # Decisions — Promise Them Nothing Twice
 
-<!-- Candidates: copy this file to submissions/<your-github-username>/promise-them-nothing-twice/DECISIONS.md and replace the prompts below. Keep it to one page. -->
-
 ## Conflict resolution
 
-<!-- What you decided, what you rejected, and why. -->
-
-- **Decided:** Hard enforcement on the **configured** limit — never admit traffic above it. Northwind gets an auditable, config-driven higher limit during **02:00–04:00 UTC** (not a hardcoded customer bypass). Other customers stay on tier defaults.
-- **Rejected:** Literal “never exceed contracted quota” for Northwind during batch (300 RPM vs ~800–1200 RPM sustained, ~2.7×–4× over contract). Fail-open when Redis is down. Marcus-style invisible errors via quota overages.
-- **Tradeoff accepted:** Northwind is a documented commercial exception; same-tier fairness does not apply during the batch window.
+We decided to enforce a strict hard cap on the configured limits, meaning traffic is never allowed to exceed the active quota under any circumstances. Rather than a hardcoded bypass or a literal attempt to maintain a 300 RPM limit for Northwind during their nightly batch window (which would be commercial suicide and result in huge data delivery delays), Northwind is granted an auditable, higher limit of 1500 RPM during 02:00–04:00 UTC. Other customers remain on their tier defaults at all times. We rejected a literal "never exceed contracted quota" for Northwind because their batch process requires a sustained throughput of up to 1200 RPM, and keeping them at 300 RPM is commercially unacceptable. We also rejected failing open when Redis is down, as that would risk catastrophic over-admissions, choosing instead to return 503 Service Unavailable (fail closed) to protect upstream APIs. Finally, we rejected silent Marcus-style rate limit errors. We accept the tradeoff that same-tier fairness does not apply during Northwind's batch window.
 
 ## Technical design
 
-<!-- Algorithm, coordination across nodes, and the tradeoffs you accepted. -->
-
-- **Stack:** Go, bare `net/http`, Docker Compose — 3 app replicas, load balancer, Redis for global counts across nodes.
-- **Redis unavailable:** Return **503** (fail closed). Preserves hard cap; avoids the deprecated limiter’s over-admit failure mode.
-- **Algorithm:** Sliding Window Log via Redis Sorted Sets (`ZSET`). Guarantees a strict hard cap over any rolling 60-second window, preventing boundary-burst failures (e.g., 600 requests in 2s) seen in previous limiters.
-- **Clock Decoupling:** The Go app uses a request-scoped mockable clock to evaluate the 02:00–04:00 UTC business-logic window. The `X-Fake-Time` header is strictly ignored unless `ALLOW_MOCK_TIME=true` is set in the container environment (preventing production bypasses). The Redis Lua rate-limit script uses a centralized `redis.call('TIME')` to perfectly synchronize counting across all nodes and prevent clock-drift over-admission.
-- **ZSET Mechanics:** To prevent concurrent request collisions (undercounting), the ZSET score is the Redis timestamp and the member is a Go-generated UUID. Keys are aggressively expired (`PEXPIRE`) after 60s.
-- **Rejection & Retry-After:** Rejected requests are *not* added to the ZSET to avoid a penalty-box effect for aggressive clients. `Retry-After` is calculated by finding the oldest successful request in the 60s window and returning the integer seconds until it expires.
-- **Deferred:** Exact Northwind batch RPM in config, config file format.
+The system is built as a Go application using the standard `net/http` library, deployed as three replicated app nodes behind an NGINX round-robin load balancer, with Redis serving as the shared global state store. Rate limiting is implemented using a Sliding Window Log via Redis Sorted Sets (`ZSET`) executed atomically through a Lua script. When Redis is unavailable or returns an error, the limiter fails closed by returning a 503 response. To avoid clock-drift issues across distributed nodes, the Lua script uses `redis.call('TIME')` as the absolute time source, while a mockable request clock in Go permits time-based testing when `ALLOW_MOCK_TIME` is enabled. The `ZSET` score uses the Redis millisecond timestamp, and members are assigned Go-generated UUIDs to prevent write collisions. Expired requests are cleaned up with a 60-second TTL (`PEXPIRE`), and rejected requests are excluded from the ZSET to prevent lockouts. `Retry-After` header values are dynamically calculated from the remaining lifetime of the oldest successful request in the sliding window. Real-time configuration files and dynamic DB configuration were deferred, leaving customer rate limits hardcoded in Go memory.
 
 ## Verification
 
-<!-- What your harness proves and what it does not. -->
+The verification harness proves that our sliding window log rate limiter operates as designed under active load. Specifically, it proves: strict per-customer enforcement at quota limits (Starter at 60 RPM, Enterprise outside window at 300 RPM); correct return of HTTP 429 and accurate `Retry-After` headers when limits are breached; multi-node load balancing across all three replicas; the 1500 RPM limit override for the Northwind nightly window; tenant isolation under concurrent hammer load (Priya's demo); correct blocking of double-burst boundary attacks that trick naive fixed-window limiters; request-level mock clock behavior; and fail-closed 503 responses when Redis is completely stopped.
 
-- **Proves:** Per-customer hard cap at quota boundaries; 429 + `Retry-After` when over limit; multi-node load balancing; Northwind batch window override (exact hard cap of 1500 RPM verified by sending 1700 requests); Priya's demo proving per-customer isolation under concurrent hammering; Sliding Window Log double-burst blocking at boundaries; time-window switching via request-level mock clock; fail-closed behavior returning 503 on Redis outage.
-- **Does not prove:** Post-window 429s when limit drops at 04:00 UTC (explicitly out of scope). Production-scale Redis failure modes or retry-storm behavior.
+However, the harness does not prove production-grade robustness. It does not prove long-term stability under sustained multi-day load. All test traffic originates from a single machine, masking network latency and partition issues. Redis failure is only verified as a complete offline outage rather than a slow, degraded, or flaky connection. The batch window transition is simulated using a mock request clock rather than UTC wall clock time. Finally, the harness cannot verify the critical 04:00 UTC transition when the limit drops back to 300 RPM while Northwind continues to transmit data.
 
 ## If I had four more hours
 
-- Implement taper or grace mechanisms at window boundaries (e.g. at 04:00 UTC) to prevent abrupt rate-limiting drops; integrate structured telemetry and dashboards to trace Redis connection pool latencies; automate harness stress-testing in the CI/CD pipeline.
+If we had four more hours, we would prioritize addressing the critical boundary transition at 04:00 UTC. We would implement a smooth tapering or grace mechanism to prevent massive bursts of 429s when the limit abruptly drops back to 300 RPM. Second, we would implement dynamic configuration loading from an external database or environment variables to replace the hardcoded rate limit map. Third, we would expand the test suite to simulate advanced network failures, such as slow Redis response latencies or partial connection dropouts. Finally, we would run load tests from multiple client machines to evaluate Redis lock contention and NGINX distribution under realistic high-concurrency environments.
