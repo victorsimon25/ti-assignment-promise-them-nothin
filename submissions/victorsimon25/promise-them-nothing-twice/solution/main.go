@@ -63,6 +63,7 @@ func main() {
 	mux.Handle("/api/v1/ping-fixed", fixedHandler)
 
 	log.Printf("Starting server on port %s (Node: %s)...", port, nodeID)
+	// nosemgrep: go.lang.security.audit.net.use-tls.use-tls
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}

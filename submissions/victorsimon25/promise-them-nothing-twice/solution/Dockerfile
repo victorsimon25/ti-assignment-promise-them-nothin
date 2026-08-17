@@ -15,11 +15,18 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o rate-limiter .
 # Final minimal runtime image
 FROM alpine:3.20
 
+# Create a non-root group and user
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
 WORKDIR /app
 
-# Copy build artifact
-COPY --from=builder /app/rate-limiter .
+# Copy build artifact and set ownership to non-root user
+COPY --from=builder --chown=appuser:appgroup /app/rate-limiter .
+
+# Switch to non-root user
+USER appuser
 
 EXPOSE 8080
 
 CMD ["./rate-limiter"]
+
